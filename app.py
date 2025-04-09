@@ -1,5 +1,6 @@
 import os
 import logging
+import uuid
 from datetime import datetime, timedelta
 from functools import wraps
 from urllib.parse import quote
@@ -11,6 +12,14 @@ import io
 
 from yahoo_scraper import scrape_yahoo_finance_history, get_period_timestamps
 import traceback
+
+# Import the alternative API module
+try:
+    from alternative_api import get_stock_data_from_api
+    ALTERNATIVE_API_AVAILABLE = True
+except ImportError:
+    ALTERNATIVE_API_AVAILABLE = False
+    logging.warning("alternative_api module not available. Install yfinance for fallback functionality.")
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
@@ -24,7 +33,7 @@ app.secret_key = os.environ.get("SESSION_SECRET", "dev-secret-key")
 cache_config = {
     "DEBUG": True,
     "CACHE_TYPE": "SimpleCache",
-    "CACHE_DEFAULT_TIMEOUT": 300  # 5 minutes
+    "CACHE_DEFAULT_TIMEOUT": 1800  # 30 minutes
 }
 app.config.from_mapping(cache_config)
 cache = Cache(app)
@@ -73,17 +82,29 @@ def scrape():
             logger.debug(f"Scraping new data for {ticker}")
             df = scrape_yahoo_finance_history(url)
             
+            # If scraping fails, try alternative API if available
+            if (df is None or df.empty) and ALTERNATIVE_API_AVAILABLE:
+                logger.info(f"Scraping failed, trying alternative API for {ticker}")
+                df = get_stock_data_from_api(ticker, start_date, end_date)
+                source = "api"
+            else:
+                source = "scrape"
+            
+            # If both methods fail, show error
             if df is None or df.empty:
                 flash(f"No data found for {ticker} in the selected date range", "warning")
                 return redirect(url_for('index'))
             
             # Cache the result
             cache.set(cache_key, df)
-            source = "scrape"
         
-        # Store in session for download
+        # Store the complete dataframe in session
+        # We use json to serialize it with special handling for dates
         session['last_df'] = df.to_json(orient='split', date_format='iso')
         session['ticker'] = ticker
+        
+        # Log the number of records for debugging
+        logger.debug(f"Found {len(df)} records for {ticker}")
         
         # Format data for display
         data_for_template = {
@@ -114,6 +135,9 @@ def download():
         # Retrieve the data from the session
         df = pd.read_json(session['last_df'], orient='split')
         ticker = session['ticker']
+        
+        # Log the record count for debugging
+        logger.debug(f"Exporting {len(df)} records to Excel for {ticker}")
         
         # Create Excel file in memory
         output = io.BytesIO()
